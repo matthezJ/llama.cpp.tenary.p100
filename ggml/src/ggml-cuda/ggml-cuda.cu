@@ -1819,6 +1819,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// GP100 (sm_60) fp16 PQ2_0 mat-vec, 1-4 columns, bit-identical to mul_mat_vec_pq2_0_ordered; returns false when
+// disabled (GGML_CUDA_GP100_MMVQ_DISABLE=1) or on any other device, falling back to the dp4a kernel (mmvq-pq2-gp100.cu)
+bool ggml_cuda_mul_mat_pq2_0_ordered_gp100(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 // PQ2_0 mat-vec for Pascal, 1-4 columns, bit-identical to the generic mmvq there. The generic kernel (4 warps,
 // 32 blocks per iteration) gives thread t = 32*w + lane the 32-chunks t, t+128, ...: it sums them in order into
 // v[w], then warp 0 adds ((v0 + v1) + v2) + v3 and does the warp butterfly. Here ONE warp keeps that order for a
@@ -1973,6 +1977,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             !ggml_cuda_batch_invariant() && ne11 <= 4 && ne00 % QK_PQ2_0 == 0 &&
             ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguous(src0) &&
             ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        if (ggml_cuda_mul_mat_pq2_0_ordered_gp100(ctx, src0, src1, dst)) { // GP100 fp16, default on, bit-identical
+            return;
+        }
         ggml_cuda_mul_mat_pq2_0_ordered(ctx, src0, src1, dst);
         return;
     }

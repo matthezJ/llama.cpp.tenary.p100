@@ -147,6 +147,33 @@ static __global__ void quantize_q8_1(
         *ds = make_half2(__float2half(d), __short_as_half((short) isum));
         return;
     }
+    if constexpr (layout == GGML_CUDA_Q8_1_PQ2_F16) {
+        // GP100 PQ2 mat-vec activation layout (mmvq-pq2-gp100.cu): per 32-block, pair p (0..15) holds
+        // elements (p, p+8) within each 16-element half, as half2 pre-scaled by 2^8 so one HFMA2 with a
+        // subnormal code weight (c * 2^-24) accumulates c*q*2^-16 exactly. Payload blocks packed at 64 B
+        // (16-byte aligned for the kernel's int4 loads), all ds of the row after the payload: 68 B per
+        // block (2x block_q8_1). The ds slot keeps (d, raw int sum bits) like PQ2.
+        const int64_t row_cont = (i3*ne2.z + i2) * ne1 + i1;
+        char * ycol = (char *) vy + row_cont * (ne0 * 17 / 8); // 17 bytes per element = 68 per 32-block
+        const int64_t kb = i0 / QK8_1;
+        const int     e  = i0 % QK8_1;
+        const int     p  = (e / 16) * 8 + (e % 8); // pair index within the block
+        half * yh = (half *) (ycol + kb*64 + p*4) + (e >> 3 & 1);
+
+        int isum = q;
+        isum = warp_reduce_sum<QK8_1>(isum);
+
+        *yh = __float2half(q * 256.0f);
+
+        if (iqs > 0) {
+            return;
+        }
+
+        // |isum| <= 32*127 fits int16; keep the raw bits in the half slot.
+        half2 * ds = (half2 *) (ycol + ne0*2) + kb;
+        *ds = make_half2(__float2half(d), __short_as_half((short) isum));
+        return;
+    }
     if constexpr (layout == GGML_CUDA_Q8_1_SOA_ISUM) {
         // Warp-transposed layout (see ggml_cuda_ptq1_q8_word); ne0 is padded to GGML_CUDA_PTQ1_K_PAD.
         int isum = q;
@@ -902,6 +929,9 @@ void quantize_row_q8_1_cuda(
             break;
         case GGML_CUDA_Q8_1_PQ2:
             ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_PQ2>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+            break;
+        case GGML_CUDA_Q8_1_PQ2_F16:
+            ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_PQ2_F16>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
             break;
         default:
             ggml_cuda_kernel_launch(quantize_q8_1<GGML_CUDA_Q8_1_AOS>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);

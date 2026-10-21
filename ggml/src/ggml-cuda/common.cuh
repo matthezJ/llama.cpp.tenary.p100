@@ -1050,12 +1050,15 @@ struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0> {
 
 // Activation (src1) q8_1 layouts produced by quantize_row_q8_1_cuda and consumed by the MMVQ kernels.
 // Every layout keeps block_q8_1's bytes per row, so launcher strides in block_q8_1 units are valid
-// for all three; only the byte order inside a column differs.
+// for all three; only the byte order inside a column differs. Exception: PQ2_F16 doubles the payload
+// per block; only the GP100 PQ2 wrapper reads it and passes its own byte strides.
 enum ggml_cuda_q8_1_layout : int {
     GGML_CUDA_Q8_1_AOS      = 0, // plain block_q8_1 array (every type except the PTQ1_0 cases below)
     GGML_CUDA_Q8_1_SOA_ISUM = 1, // PTQ1_0, one column: warp-transposed, exact int sums (ggml_cuda_ptq1_q8_word)
     GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
     GGML_CUDA_Q8_1_PQ2      = 3, // PQ2_0, 3-8 columns, plain 2D, Ada: permuted qs plus half2 (d, int sum) per block (mmvq-pq2_0.cuh)
+    GGML_CUDA_Q8_1_PQ2_F16  = 4, // PQ2_0, 1-4 columns, plain 2D, GP100: 16 pre-scaled half2 pairs per block, 68 bytes per
+                                 // block (2x block_q8_1 payload), consumed only by mmvq-pq2-gp100.cu
 };
 
 // Column-count helper, not the layout decision. 2-8 columns and MoE (ids) take the planar
