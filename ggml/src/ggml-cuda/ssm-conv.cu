@@ -157,6 +157,80 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
+// Window-in-place variant for the fused conv (one token, one sequence; ggml_cuda_try_conv_window):
+// the (d_conv-1)-token window is read straight from the conv cache row (tokens minor over channels,
+// the (d_conv-1, C) reshape of the gathered row) and the current token from x; after the dot the
+// shifted window is written back to the cache row. GGML_CUDA_GP100_STATE_DISABLE=1 disables the path.
+template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+static __global__ void ssm_conv_window_f32(const float * __restrict__ state_ptr, const int32_t * __restrict__ ids,
+                                           const float * __restrict__ x_ptr, const float * __restrict__ src1_ptr,
+                                           const float * __restrict__ bias_ptr, const int src1_nb1,
+                                           const int64_t state_row, const int64_t x_stride, const int64_t c,
+                                           float * __restrict__ dst_ptr, const int dst_nb0, float * __restrict__ state_out_ptr) {
+    const int tid      = threadIdx.x;
+    const int bidy     = blockIdx.y;
+    const int stride_w = src1_nb1 / sizeof(float);
+
+    const float * w_block = src1_ptr + (size_t) bidy * split_d_inner * stride_w;
+    const float * win     = state_ptr + (int64_t) ids[blockIdx.x] * state_row + (size_t) bidy * split_d_inner + tid;
+    const float * x_row   = x_ptr + (size_t) bidy * split_d_inner * x_stride + tid;
+    float *       out_win = state_out_ptr + (size_t) bidy * split_d_inner + tid;
+    float *       y_block = dst_ptr + (size_t) bidy * split_d_inner * dst_nb0;
+
+    float w[d_conv] = { 0.0f };
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_block[tid * stride_w + j];
+    }
+
+    float b = bias_ptr != nullptr ? bias_ptr[bidy * split_d_inner + tid] : 0.0f;
+
+    float xw[d_conv];
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        xw[j] = win[j * c];
+    }
+    xw[d_conv - 1] = *x_row;
+
+    float sumf = 0.0f;
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        sumf += xw[j] * w[j];
+    }
+    sumf += b;
+    y_block[tid * dst_nb0] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        out_win[j * c] = xw[j + 1];
+    }
+}
+
+template <bool apply_silu>
+static void ssm_conv_window_f32_cuda(const ggml_cuda_ssm_conv_window & window, const float * src1, const float * bias,
+                                     const int src1_nb1, float * dst, const int dst_nb0, cudaStream_t stream) {
+    const int threads = 128;
+    GGML_ASSERT(window.c % threads == 0);
+
+    const dim3 blocks(1, (int) (window.c / threads), 1);
+    auto launch_kernel = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+        ggml_cuda_kernel_launch(ssm_conv_window_f32<apply_silu, threads, kNC>, launch_params, window.state, window.ids,
+                                window.x, src1, bias, src1_nb1, window.state_row, window.x_stride, window.c, dst,
+                                dst_nb0, window.state_out);
+    };
+
+    switch (window.dc) {
+        case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
+        case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+    }
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
@@ -171,6 +245,21 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 
     // When fusing, write to silu_dst (the node downstream references).
     const struct ggml_tensor * out = fuse_silu ? silu_dst : dst;
+
+    // Window-in-place path (ggml_cuda_try_conv_window, GP100 decode): no CONCAT, the kernel reads the
+    // cached window and the current token itself and writes the shifted window back to the cache.
+    if (const ggml_cuda_ssm_conv_window * window = ctx.conv_windows().find(dst)) {
+        GGML_ASSERT(out->ne[1] == 1 && out->ne[2] == 1);
+        const float * bias_d = fuse_bias ? (const float *) bias->data : nullptr;
+        if (fuse_silu) {
+            ssm_conv_window_f32_cuda<true>(*window, (const float *) src1->data, bias_d, src1->nb[1], (float *) out->data,
+                                           out->nb[0] / sizeof(float), ctx.stream());
+        } else {
+            ssm_conv_window_f32_cuda<false>(*window, (const float *) src1->data, bias_d, src1->nb[1], (float *) out->data,
+                                            out->nb[0] / sizeof(float), ctx.stream());
+        }
+        return;
+    }
 
     const int64_t nc  = src1->ne[0];                // d_conv
     const int64_t nr  = src0->ne[1];                // d_inner

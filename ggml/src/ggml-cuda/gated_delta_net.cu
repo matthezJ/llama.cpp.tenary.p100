@@ -4,13 +4,17 @@
 
 #include <cstdlib>
 
-// Host and device must agree on columns/warp. Kernel uses __CUDA_ARCH__; host uses ggml_cuda_highest_compiled_arch(cc). NVIDIA Ampere+ and S_v==128 and !KDA -> 4; HIP/MUSA stay 1.
+// Host and device must agree on columns/warp. Kernel uses __CUDA_ARCH__; host passes the runtime cc for
+// a GP100 (cc == 600 always runs the exact-match sm_60 cubin, also out of 60;61 builds) and
+// ggml_cuda_highest_compiled_arch(cc) otherwise. NVIDIA Ampere+ and GP100 (S_v==128, !KDA) -> 4; HIP/MUSA stay 1.
+// GGML_CUDA_GP100_GDN_CPW_DISABLE=1 forces 1 on both sides via the CPW1 instantiation.
 static constexpr __host__ __device__ int gdn_cols_per_warp(int arch, int S_v, bool KDA) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     (void) arch; (void) S_v; (void) KDA;
     return 1;
 #else
-    return GGML_CUDA_CC_IS_NVIDIA(arch) && arch >= GGML_CUDA_CC_AMPERE && S_v == 128 && !KDA ? 4 : 1;
+    return GGML_CUDA_CC_IS_NVIDIA(arch) && (arch == GGML_CUDA_CC_PASCAL || arch >= GGML_CUDA_CC_AMPERE) &&
+           S_v == 128 && !KDA ? 4 : 1;
 #endif
 }
 
@@ -24,7 +28,8 @@ static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_
 // RAW: beta and g arrive pre-activation (ggml_gated_delta_net_set_raw_gates); the kernel applies
 // sigmoid(beta) and raw_a[h] * softplus(g + raw_dt_bias[h]) with the unary kernels' formulas.
 // G_PRECOMPUTED: g already holds exp(g) (GB10 long-prompt path); only used with RAW == false.
-template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED>
+// CPW1: force one column per warp (GGML_CUDA_GP100_GDN_CPW_DISABLE fallback instantiation).
+template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, bool CPW1 = false>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -60,7 +65,7 @@ gated_delta_net_cuda(const float * q,
     // Each warp owns one or more columns, using warp-level primitives to reduce across rows.
     const int      lane     = threadIdx.x;
 #if defined(__CUDA_ARCH__)
-    constexpr int cols_per_warp = gdn_cols_per_warp(__CUDA_ARCH__, S_v, KDA);
+    constexpr int cols_per_warp = CPW1 ? 1 : gdn_cols_per_warp(__CUDA_ARCH__, S_v, KDA);
 #else
     constexpr int cols_per_warp = 1; // host pass only; never executed
 #endif
@@ -222,7 +227,7 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED>
+template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, bool CPW1 = false>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * rb_d, const float * ra_d, const float * s_d,
@@ -238,9 +243,25 @@ static void launch_gated_delta_net(
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int num_warps = 4;
-    // Same predicate as the kernel, fed the arch compiled for this cc.
-    const int cols_per_warp = GGML_CUDA_CC_IS_NVIDIA(cc) ? gdn_cols_per_warp(ggml_cuda_highest_compiled_arch(cc), S_v, KDA) : 1;
-    dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols_per_warp - 1) / (num_warps * cols_per_warp));
+    // Same predicate as the kernel. A cc == 600 device runs the exact-match sm_60 cubin even out of a
+    // 60;61 build, so the kernel's __CUDA_ARCH__ is 600 there and the host must predict that, not
+    // highest_compiled_arch (which is 610 in a mixed build).
+    const int cols_per_warp = GGML_CUDA_CC_IS_NVIDIA(cc)
+        ? gdn_cols_per_warp(cc == GGML_CUDA_CC_PASCAL ? GGML_CUDA_CC_PASCAL : ggml_cuda_highest_compiled_arch(cc), S_v, KDA)
+        : 1;
+    // Kill switch: rerun as the forced-1-column instantiation with a matching grid (stock behavior).
+    if constexpr (!CPW1) {
+        static const bool cpw_disabled = getenv("GGML_CUDA_GP100_GDN_CPW_DISABLE") != nullptr &&
+            atoi(getenv("GGML_CUDA_GP100_GDN_CPW_DISABLE")) != 0;
+        if (cpw_disabled && cols_per_warp == 4) {
+            launch_gated_delta_net<KDA, keep_rs_t, RAW, G_PRECOMPUTED, true>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d,
+                dst_d, state_d, S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, stream);
+            return;
+        }
+    }
+    const int cols = CPW1 ? 1 : cols_per_warp;
+    dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols - 1) / (num_warps * cols));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
@@ -249,19 +270,19 @@ static void launch_gated_delta_net(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
     switch (S_v) {
         case 16:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW, G_PRECOMPUTED, CPW1>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
             break;
         case 32:
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW, G_PRECOMPUTED, CPW1>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
             break;
         case 64: {
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW, G_PRECOMPUTED, CPW1>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);
@@ -275,7 +296,7 @@ static void launch_gated_delta_net(
             if constexpr (keep_rs_t && !KDA) {
                 if (l8_enabled && GGML_CUDA_CC_IS_NVIDIA(cc) &&
                     ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && warp_size == 32 &&
-                    cols_per_warp == 4 && n_tokens >= GDN_L8V_MIN_TOKENS && n_tokens <= GDN_L8V_MAX_TOKENS) {
+                    !CPW1 && cols_per_warp == 4 && n_tokens >= GDN_L8V_MIN_TOKENS && n_tokens <= GDN_L8V_MAX_TOKENS) {
                     ggml_cuda_kernel_launch(gated_delta_net_l8v_cuda<RAW, G_PRECOMPUTED>, launch_params, q_d, k_d,
                                             v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H, n_tokens, n_seqs,
                                             sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic,
@@ -284,7 +305,7 @@ static void launch_gated_delta_net(
                 }
             }
 #endif
-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, CPW1>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride);

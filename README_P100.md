@@ -12,6 +12,9 @@ Patch-Doku liegen in `../docs/` (Einstieg: `../docs/README.md`).
 | Optimierung | Umfang | Schalter | Doku |
 |---|---|---|---|
 | fp16-PQ2_0-Matvec fuer GP100 (Patch A) | Decode, 1-4 Spalten, plain 2D: ersetzt auf sm_60 die emulierte dp4a-Arithmetik des Kernels `mul_mat_vec_pq2_0_ordered` durch full-rate HFMA2. **Bit-identischer Output** zum dp4a-Pfad. SASS: -27% Instruktionen je Gewicht raw, -18% issue-gewichtet. Laufzeitmessung steht noch aus (P100). | `GGML_CUDA_GP100_MMVQ_DISABLE`, `GGML_CUDA_GP100_MMVQ_R` | `../docs/12-patch-a-fp16-pq2-matvec.md` |
+| conv-Fenster in place (Patch D-Rest) | Decode: ssm_conv liest das Fenster direkt aus der Cache-Zeile und schreibt das verschobene zurueck; GET_ROWS/CONCAT/CPY entfallen. 1 Token/1 Sequenz, bit-identisch. | `GGML_CUDA_GP100_STATE_DISABLE` | `../docs/14-patch-d-e-g.md` |
+| GDN-Prefill 4 State-Spalten/Warp (Patch E) | Prefill: 4 Spalten je Warp auf GP100 (bit-identisch, p100-0018: +3.8% pp dort gemessen). | `GGML_CUDA_GP100_GDN_CPW_DISABLE` | `../docs/14-patch-d-e-g.md` |
+| convert_unary vektorisiert (Patch G) | Prefill: 4 Elemente/Thread im kontiguen Convert (bit-identisch; p100-0005: +4.6% realer Request). | `GGML_CUDA_GP100_CONV_DISABLE` | `../docs/14-patch-d-e-g.md` |
 
 Der fp16-Pfad greift automatisch, wenn das Runtime-Geraet cc == 600 meldet
 (P100). Auf P40 (sm_61, fp16 lahmgelegt) und allem Neueren (natives dp4a)
@@ -70,9 +73,13 @@ erfordern ein Reconfigure (CMake globbt).
 |---|---|---|
 | `GGML_CUDA_GP100_MMVQ_DISABLE` | unset (fp16-Pfad **an**) | `=1` schaltet den fp16-PQ2_0-Matvec ab; Decode laeuft dann wieder durch den dp4a-Kernel `mul_mat_vec_pq2_0_ordered`. Damit ist jeder A/B ein einziges Binary (kein Cross-Build). A/B-Protokoll: `../docs/06-validierung.md`. |
 | `GGML_CUDA_GP100_MMVQ_R` | `4` | Zeilen je Warp im fp16-Kernel (Template-Parameter): `2`, `4` oder `8`; jeder andere Wert faellt auf 4 zurueck. Fuer den Launch-Sweep auf der P100 (p100-Patch-0002-Muster). R aendert nur die Launch-Geometrie, nicht die Arithmetik. |
+| `GGML_CUDA_GP100_STATE_DISABLE` | unset (conv-Fenster **an**) | `=1` stock-Pfad des conv-Fensters: GET_ROWS/CONCAT/CPY werden wieder ausgefuehrt statt im ssm_conv-Kernel in place zu lesen/schreiben (GP100, Decode, 1 Token/1 Sequenz). |
+| `GGML_CUDA_GP100_GDN_CPW_DISABLE` | unset (4 Spalten **an**) | `=1` 1 State-Spalte je Warp im GDN-Kernel auf GP100 (Forced-1-Instantiierung, Stock-Verhalten; 4 Spalten sind default und bit-identisch). |
+| `GGML_CUDA_GP100_CONV_DISABLE` | unset (vektorisiert **an**) | `=1` generischer 1-Element/Thread-`convert_unary` statt des 4-Elemente/Thread-Pfads. |
 
-Beide Schalter werden einmalig pro Prozess eingelesen (static) und wirken nur
-auf cc == 600. Konvention fuer kommende Patches: `GGML_CUDA_GP100_<NAME>_DISABLE=1`
+Beide MMVQ-Schalter werden einmalig pro Prozess eingelesen (static) und wirken nur
+auf cc == 600; STATE/GDN_CPW/CONV ebenso. Konvention fuer kommende Patches:
+`GGML_CUDA_GP100_<NAME>_DISABLE=1`
 faellt auf den Stock-Pfad zurueck; schnelle Pfade sind default an
 (`../docs/09-umsetzungsplan.md`, Abschnitt Env-Konvention).
 

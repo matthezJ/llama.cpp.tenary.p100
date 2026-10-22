@@ -531,8 +531,53 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
+// Vectorised contiguous conversion: the generic convert_unary handles arbitrary strides one
+// element per thread; convert_unary_cont_cuda always hits the degenerate y[i] = cast(x[i]) case
+// (a 4-byte load and a 2-byte store per thread for f32 -> f16). Four elements per thread make that
+// a 16-byte load and an 8-byte store. GGML_CUDA_GP100_CONV_DISABLE=1 takes the generic kernel.
+#define CONV_VEC 4
+
+template <typename T> struct __align__(16) conv_vec_t { T v[CONV_VEC]; };
+
+template <typename src_t, typename dst_t>
+static __global__ void convert_unary_cont_vec(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = CONV_VEC*((int64_t)blockDim.x*blockIdx.x + threadIdx.x);
+
+    if (i >= k) {
+        return;
+    }
+
+    const src_t * x = (const src_t *) vx;
+
+    const conv_vec_t<src_t> sv = *((const conv_vec_t<src_t> *) (x + i));
+    conv_vec_t<dst_t> dv;
+#pragma unroll
+    for (int j = 0; j < CONV_VEC; ++j) {
+        dv.v[j] = ggml_cuda_cast<dst_t>(sv.v[j]);
+    }
+    *((conv_vec_t<dst_t> *) (y + i)) = dv;
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    static const bool disabled = getenv("GGML_CUDA_GP100_CONV_DISABLE") != nullptr &&
+        atoi(getenv("GGML_CUDA_GP100_CONV_DISABLE")) != 0;
+
+    // the vector path reads and writes CONV_VEC elements at a time: element count and both
+    // pointers must be aligned to the vector width, anything else keeps the generic kernel
+    const bool can_vec = !disabled &&
+        (k % CONV_VEC == 0) &&
+        (((uintptr_t) vx) % (CONV_VEC*sizeof(src_t)) == 0) &&
+        (((uintptr_t) y)  % (CONV_VEC*sizeof(dst_t)) == 0);
+
+    if (can_vec) {
+        const int64_t nthreads = k / CONV_VEC;
+        const int64_t nblocks  = (nthreads + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+        convert_unary_cont_vec<src_t, dst_t><<<nblocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+        return;
+    }
+
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 

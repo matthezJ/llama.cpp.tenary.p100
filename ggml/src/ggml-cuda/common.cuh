@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1576,6 +1577,21 @@ struct ggml_cuda_gated_delta_net_gather {
     int64_t         row_stride = 0;       // in floats
 };
 
+// Conv window folded into the ssm_conv kernel (GP100, decode): instead of
+// GET_ROWS(conv cache) -> CONCAT(window, x) -> SSM_CONV -> CPY(last window back), the kernel reads
+// the cached window and the current token directly and writes the shifted window itself. Keyed by
+// node pointer like the GDN gather; the GET_ROWS/CONCAT/view/CPY nodes are listed in `skipped`.
+struct ggml_cuda_ssm_conv_window {
+    const float *   state     = nullptr; // conv cache, state_row floats per sequence row
+    const int32_t * ids       = nullptr; // per-sequence cache row index
+    int64_t         state_row = 0;       // floats per cache row
+    const float *   x         = nullptr; // current token, C channels, x_stride floats apart
+    int64_t         x_stride  = 0;
+    float *         state_out = nullptr; // cache view receiving the shifted (d_conv-1)-token window
+    int64_t         dc        = 0;       // d_conv
+    int64_t         c         = 0;       // channels
+};
+
 // Owned by the backend context that evaluates the graph: registrations are keyed by node pointer,
 // so they are only meaningful for the evaluation that made them. Reset at the start of every
 // graph evaluation/capture; never shared between contexts or threads.
@@ -1593,6 +1609,34 @@ struct ggml_cuda_gdn_gather_context {
     const ggml_cuda_gated_delta_net_gather * find(const ggml_tensor * gdn) const {
         const auto it = gathers.find(gdn);
         return it == gathers.end() ? nullptr : &it->second;
+    }
+};
+
+// Same ownership rules as the GDN gather context above.
+struct ggml_cuda_ssm_conv_window_context {
+    std::unordered_map<const ggml_tensor *, ggml_cuda_ssm_conv_window> windows;
+    std::unordered_set<const ggml_tensor *> skipped;
+
+    void reset() {
+        windows.clear();
+        skipped.clear();
+    }
+
+    void set(const ggml_tensor * conv, const ggml_cuda_ssm_conv_window & window) {
+        windows[conv] = window;
+    }
+
+    const ggml_cuda_ssm_conv_window * find(const ggml_tensor * conv) const {
+        const auto it = windows.find(conv);
+        return it == windows.end() ? nullptr : &it->second;
+    }
+
+    void mark_skipped(const ggml_tensor * t) {
+        skipped.insert(t);
+    }
+
+    bool is_skipped(const ggml_tensor * t) const {
+        return skipped.count(t) != 0;
     }
 };
 
@@ -1711,6 +1755,7 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
     ggml_cuda_gdn_gather_context gdn_gather_context;
+    ggml_cuda_ssm_conv_window_context ssm_conv_window_context;
     ggml_cuda_fwht_q8_context    fwht_q8_context;
 
     ~ggml_backend_cuda_context();
@@ -1728,6 +1773,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
     ggml_cuda_gdn_gather_context & gdn_gathers() { return gdn_gather_context; }
+    ggml_cuda_ssm_conv_window_context & conv_windows() { return ssm_conv_window_context; }
 
     ggml_cuda_fwht_q8_context & fwht_q8() { return fwht_q8_context; }
 

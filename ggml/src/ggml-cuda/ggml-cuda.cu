@@ -3044,6 +3044,168 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     return consumed;
 }
 
+
+// GP100 decode: fold the conv window into the ssm_conv kernel. Matches G = GET_ROWS(conv cache) ->
+// [RESHAPE] -> CC = CONCAT(G, x, 0) -> SSM_CONV plus the CPY of CC's last dc-1 columns back into the
+// cache (this fork builds that CPY before the conv). One token and one sequence only. On a match none
+// of G/RESHAPE/CC/view/CPY run: the kernel reads the cached window and x itself and writes the shifted
+// window (ggml_cuda_ssm_conv_window). Stateless: the eval loop calls this at the GET_ROWS node.
+// GGML_CUDA_GP100_STATE_DISABLE=1 disables it.
+static bool ggml_cuda_try_conv_window(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    static const bool disabled = getenv("GGML_CUDA_GP100_STATE_DISABLE") != nullptr &&
+                                 atoi(getenv("GGML_CUDA_GP100_STATE_DISABLE")) != 0;
+    if (disabled) {
+        return false;
+    }
+    if (ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_PASCAL) {
+        return false;
+    }
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data;
+        const char * b1 = b0 + ggml_nbytes(b);
+        return a0 != nullptr && b0 != nullptr && a0 < b1 && b0 < a1;
+    };
+    auto find_node = [&](const ggml_tensor * t, int lo, int hi) {
+        for (int j = std::max(0, lo); j < std::min(hi, cgraph->n_nodes); ++j) {
+            if (cgraph->nodes[j] == t) {
+                return j;
+            }
+        }
+        return -1;
+    };
+
+    const ggml_tensor * g = cgraph->nodes[node_idx];
+    if (g->type != GGML_TYPE_F32 || (g->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(g) ||
+            g->ne[1] != 1 || g->ne[2] != 1 || g->ne[3] != 1 || g->src[0] == nullptr || g->src[1] == nullptr ||
+            g->src[1]->type != GGML_TYPE_I32 || g->src[0]->type != GGML_TYPE_F32 || g->src[0]->nb[0] != sizeof(float) ||
+            g->src[0]->data == nullptr || g->src[1]->data == nullptr) {
+        return false;
+    }
+
+    // reshape view of the gather and the concat must follow within a few nodes
+    const ggml_tensor * rg  = nullptr;
+    const ggml_tensor * cat = nullptr;
+    int rg_idx  = -1;
+    int cat_idx = -1;
+    for (int j = node_idx + 1; j < std::min(node_idx + 8, cgraph->n_nodes); ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (rg == nullptr && n->op == GGML_OP_RESHAPE && n->src[0] == g) {
+            rg = n;
+            rg_idx = j;
+        } else if (rg != nullptr && cat == nullptr && n->op == GGML_OP_CONCAT && n->src[0] == rg &&
+                   ggml_get_op_params_i32(n, 0) == 0) {
+            cat = n;
+            cat_idx = j;
+            break;
+        }
+    }
+    if (cat == nullptr || (rg->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(rg) ||
+            ggml_node_get_use_count(cgraph, node_idx) != 1 || ggml_node_get_use_count(cgraph, rg_idx) != 1) {
+        return false;
+    }
+
+    // the conv and the weight; one token and one sequence (CC's ne[0] == dc)
+    const ggml_tensor * conv = nullptr;
+    int conv_idx = -1;
+    for (int j = cat_idx + 1; j < std::min(cat_idx + 8, cgraph->n_nodes); ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_SSM_CONV && n->src[0] == cat) {
+            conv = n;
+            conv_idx = j;
+            break;
+        }
+    }
+    const int64_t dc = cat->ne[0];
+    const int64_t C  = cat->ne[1];
+    if (conv == nullptr || cat->type != GGML_TYPE_F32 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            !ggml_is_contiguous(cat) || cat->ne[2] != 1 || cat->ne[3] != 1 || dc < 2 ||
+            cat->src[1] == nullptr || cat->src[1]->type != GGML_TYPE_F32 || cat->src[1]->ne[0] != 1 ||
+            cat->src[1]->ne[1] != C || cat->src[1]->nb[1] % sizeof(float) != 0 || cat->src[1]->data == nullptr ||
+            rg->ne[0] != dc - 1 || rg->ne[1] != C || rg->ne[2] != 1 || g->ne[0] != (dc - 1) * C ||
+            conv->type != GGML_TYPE_F32 || (conv->flags & GGML_TENSOR_FLAG_OUTPUT) || conv->ne[1] != 1 ||
+            conv->ne[2] != 1 || conv->src[1]->ne[0] != dc || conv->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * x = cat->src[1];
+
+    // CC's other use: the view of its last dc-1 columns, copied into the cache (before the conv in
+    // this fork's node order; same bytes the kernel writes, one step earlier)
+    const ggml_tensor * v   = nullptr;
+    const ggml_tensor * u   = nullptr;
+    const ggml_tensor * cpy = nullptr;
+    int                 v_idx  = -1;
+    for (int j = cat_idx + 1; j < std::min(cat_idx + 64, cgraph->n_nodes); ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op != GGML_OP_CPY || n->src[0] == nullptr || n->src[0]->src[0] != cat) {
+            continue;
+        }
+        v = n->src[0];
+        u = n->src[1];
+        cpy = n;
+        v_idx = find_node(v, cat_idx + 1, j);
+        if (v->view_offs != sizeof(float) || v->ne[0] != dc - 1 || v->ne[1] != C || v->ne[2] != 1 ||
+            v->nb[0] != sizeof(float) || v->nb[1] != cat->nb[1] || v_idx < 0 ||
+            ggml_node_get_use_count(cgraph, v_idx) != 1 || (v->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            u->type != GGML_TYPE_F32 || !ggml_is_contiguous(u) || ggml_nelements(u) != (dc - 1) * C ||
+            u->data == nullptr || (n->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, j) != 0 ||
+            ggml_node_get_use_count(cgraph, cat_idx) != 2) {
+            return false;
+        }
+        break;
+    }
+    if (v == nullptr) {
+        return false;
+    }
+
+    // ids must survive until the conv reads them (ggml-alloc may recycle after the last GET_ROWS)
+    const char * ids_beg = (const char *) g->src[1]->data;
+    const char * ids_end = ids_beg + ggml_nbytes(g->src[1]);
+    for (int k = node_idx + 1; k <= conv_idx; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        const char *        b = (const char *) t->data;
+        if (b != nullptr && b < ids_end && ids_beg < b + ggml_nbytes(t)) {
+            return false;
+        }
+    }
+    // x must survive until the conv reads it; the conv output may alias x exactly (same per-channel
+    // layout), any other overlap means the buffer was recycled
+    for (int k = cat_idx + 1; k <= conv_idx; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (t == conv) {
+            if (overlaps(t, x) && !(t->data == x->data && x->nb[1] == sizeof(float))) {
+                return false;
+            }
+            continue;
+        }
+        if (overlaps(t, x)) {
+            return false;
+        }
+    }
+    // the conv output must not overlap the cache rows
+    if (overlaps(conv, g->src[0])) {
+        return false;
+    }
+
+    ggml_cuda_ssm_conv_window window;
+    window.state     = (const float *) g->src[0]->data;
+    window.ids       = (const int32_t *) g->src[1]->data;
+    window.state_row = (int64_t) (g->src[0]->nb[1] / sizeof(float));
+    window.x         = (const float *) x->data;
+    window.x_stride  = (int64_t) (x->nb[1] / sizeof(float));
+    window.state_out = (float *) u->data;
+    window.dc        = dc;
+    window.c         = C;
+    ctx.conv_windows().set(conv, window);
+    ctx.conv_windows().mark_skipped(g);
+    ctx.conv_windows().mark_skipped(rg);
+    ctx.conv_windows().mark_skipped(cat);
+    ctx.conv_windows().mark_skipped(v);
+    ctx.conv_windows().mark_skipped(cpy);
+    return true;
+}
+
 // GET_ROWS and let the kernel index the cache row directly. Single-sequence only: with several
 // sequences a gathered row may alias a row another sequence writes in the same op.
 // GGML_CUDA_GDN_GATHER_FUSION=0 disables it. The registration lives in the evaluating context
@@ -4799,6 +4961,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             cuda_ctx->gdn_gathers().reset();
+        cuda_ctx->conv_windows().reset();
             cuda_ctx->fwht_q8().reset();
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4846,6 +5009,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // recurrent-state gather folded into the GDN kernel (no temp, no kernel)
                 if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active &&
                         ggml_cuda_try_gdn_gather_skip(*cuda_ctx, cgraph, i)) {
+                    continue;
+                }
+
+                // ssm_conv window folded into the conv kernel (GP100): the gather/CONCAT/state CPY
+                // are not run; the conv itself is dispatched below with the window from the registry
+                if (!is_concurrent_event_active && cuda_ctx->conv_windows().is_skipped(node)) {
+                    if (node->op != GGML_OP_SSM_CONV) {
+                        continue;
+                    }
+                }
+                if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active &&
+                        ggml_cuda_try_conv_window(*cuda_ctx, cgraph, i)) {
                     continue;
                 }
 
